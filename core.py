@@ -47,34 +47,100 @@ class CodeKnowledgeBase:
                 block = lines[start:start + chunk_lines]
                 if any(x.strip() for x in block):
                     self.chunks.append(Chunk(str(path.relative_to(base)), start + 1, start + len(block), '\n'.join(block)))
-                if start + chunk_lines >= len(lines): break
+                if start + chunk_lines >= len(lines):
+                    break
         docs = [f'{c.path}\n{c.text}' for c in self.chunks] or ['empty']
         self.matrix = self.vectorizer.fit_transform(docs)
         return len(self.chunks)
 
     def search(self, query: str, k: int = 5) -> list[tuple[Chunk, float]]:
-        if not self.chunks or self.matrix is None: return []
+        if not self.chunks or self.matrix is None:
+            return []
+
         scores = cosine_similarity(self.vectorizer.transform([query]), self.matrix)[0]
-        order = scores.argsort()[::-1][:k]
-        return [(self.chunks[i], float(scores[i])) for i in order if scores[i] > 0]
+        query_lower = query.lower()
+
+        definition_intent = any(
+            phrase in query_lower
+            for phrase in [
+                'where is', 'where does', 'implemented', 'implementation',
+                'defined', 'definition', 'which file', 'located'
+            ]
+        )
+        test_intent = any(
+            word in query_lower
+            for word in ['test', 'tests', 'testing', 'verify', 'verifies', 'verified', 'verification']
+        )
+
+        words = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', query_lower)
+        ignore_words = {
+            'where','is','the','a','an','implemented','implementation','defined','definition',
+            'which','file','does','function','method','class','located','in','of','this','application',
+            'what','should','i','run','before','changing','behavior','behaviour','applied','orders','above'
+        }
+        candidate_symbols = [word for word in words if word not in ignore_words and len(word) >= 3]
+
+        ranked: list[tuple[Chunk, float]] = []
+        for i, chunk in enumerate(self.chunks):
+            base_score = float(scores[i])
+            bonus = 0.0
+            text_lower = chunk.text.lower()
+            path_lower = chunk.path.lower()
+            filename = Path(chunk.path).name.lower()
+
+            if test_intent:
+                normalized_path = chunk.path.replace('\\', '/').lower()
+                if filename.startswith('test_') or filename.endswith('_test.py') or '/tests/' in normalized_path:
+                    bonus += 0.40
+                if re.search(r'\bdef\s+test_[a-zA-Z0-9_]+\s*\(', text_lower):
+                    bonus += 0.25
+
+            for symbol in candidate_symbols:
+                escaped = re.escape(symbol)
+                if re.search(rf'\bdef\s+{escaped}\s*\(', text_lower):
+                    bonus += 0.45
+                if re.search(rf'\bclass\s+{escaped}\b', text_lower):
+                    bonus += 0.40
+                if re.search(rf'\b(?:function|const|let|var)\s+{escaped}\b', text_lower):
+                    bonus += 0.35
+                if re.search(rf'\b(?:class|interface|enum)\s+{escaped}\b', text_lower):
+                    bonus += 0.35
+                if symbol in path_lower:
+                    bonus += 0.10
+                if definition_intent and re.search(rf'\b(?:import|from)\b[^\n]*\b{escaped}\b', text_lower):
+                    bonus -= 0.08
+
+            final_score = base_score + bonus
+            if final_score > 0:
+                ranked.append((chunk, final_score))
+
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        return ranked[:k]
 
     def overview(self) -> dict:
         files = sorted({c.path for c in self.chunks})
         languages = {}
-        for f in files: languages[Path(f).suffix or 'none'] = languages.get(Path(f).suffix or 'none', 0) + 1
+        for f in files:
+            languages[Path(f).suffix or 'none'] = languages.get(Path(f).suffix or 'none', 0) + 1
         symbols, edges = [], []
         for f in files:
-            if not f.endswith('.py'): continue
-            try: tree = ast.parse((Path(self.root) / f).read_text(errors='ignore'))
-            except (SyntaxError, OSError): continue
+            if not f.endswith('.py'):
+                continue
+            try:
+                tree = ast.parse((Path(self.root) / f).read_text(errors='ignore'))
+            except (SyntaxError, OSError):
+                continue
             symbols += [f'{f}: {n.name}' for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))][:20]
             for n in ast.walk(tree):
-                if isinstance(n, ast.Import): edges += [(f, a.name) for a in n.names]
-                elif isinstance(n, ast.ImportFrom) and n.module: edges.append((f, n.module))
+                if isinstance(n, ast.Import):
+                    edges += [(f, a.name) for a in n.names]
+                elif isinstance(n, ast.ImportFrom) and n.module:
+                    edges.append((f, n.module))
         return {'files': files, 'languages': languages, 'symbols': symbols[:80], 'imports': edges[:100]}
 
 def cited_answer(question: str, hits: list[tuple[Chunk, float]]) -> str:
-    if not hits: return 'I could not find relevant evidence in the indexed repository. Try naming a component, symbol, endpoint, or file.'
+    if not hits:
+        return 'I could not find relevant evidence in the indexed repository. Try naming a component, symbol, endpoint, or file.'
     evidence = '\n\n'.join(f'[{i}] {c.path}:{c.start}-{c.end}\n{c.text[:1800]}' for i,(c,_) in enumerate(hits,1))
     key = os.getenv('OPENAI_API_KEY')
     if key:
@@ -109,4 +175,3 @@ def create_demo(root: str):
     (base/'service.py').write_text('''from dataclasses import dataclass\n\n@dataclass\nclass Order:\n    id: str\n    total: float\n\ndef calculate_discount(order: Order) -> float:\n    """Orders above 100 receive a ten percent discount."""\n    return order.total * 0.10 if order.total > 100 else 0.0\n\ndef checkout(order: Order) -> float:\n    return order.total - calculate_discount(order)\n''')
     (base/'README.md').write_text('# Demo shop\n\n`checkout` is the public entry point. Business rules live in `service.py`. Run `pytest` before changing discount behavior.\n')
     (base/'test_service.py').write_text('from service import Order, checkout\n\ndef test_discount():\n    assert checkout(Order("A1", 200)) == 180\n')
-
